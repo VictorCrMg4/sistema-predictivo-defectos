@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import sqlite3
 import hashlib
+import uuid
 import os
 from pydriller import Repository
 from sklearn.model_selection import train_test_split
@@ -19,6 +20,22 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score,
 st.set_page_config(page_title="Sistema Predictivo de Defectos", layout="wide")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GESTION DEL TOKEN DE SESION ANONIMO (AISLAMIENTO DE USUARIO)
+# ─────────────────────────────────────────────────────────────────────────────
+if "token_sesion" not in st.session_state:
+    params = st.query_params
+    if "sid" in params and params["sid"]:
+        st.session_state["token_sesion"] = params["sid"]
+    else:
+        nuevo_token = "usr_" + uuid.uuid4().hex[:8]
+        st.session_state["token_sesion"] = nuevo_token
+        # Mantener el token en los parametros de la URL para persistencia entre recargas
+        if "admin" not in params:
+            st.query_params["sid"] = nuevo_token
+
+token_actual = st.session_state["token_sesion"]
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Base de datos SQLite (analisis_repositorios, reportes_prioridad, credenciales)
 # ─────────────────────────────────────────────────────────────────────────────
 def inicializar_bd():
@@ -28,16 +45,24 @@ def inicializar_bd():
         CREATE TABLE IF NOT EXISTS analisis_repositorios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            token_sesion TEXT DEFAULT '',
             repositorio TEXT NOT NULL,
             archivos_totales INTEGER NOT NULL,
             archivos_alto_riesgo INTEGER NOT NULL,
             porcentaje_riesgo REAL NOT NULL
         )
     """)
+    # Migracion automatica para agregar token_sesion si la tabla ya existia
+    cursor.execute("PRAGMA table_info(analisis_repositorios)")
+    cols_analisis = [col[1] for col in cursor.fetchall()]
+    if "token_sesion" not in cols_analisis:
+        cursor.execute("ALTER TABLE analisis_repositorios ADD COLUMN token_sesion TEXT DEFAULT ''")
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS reportes_prioridad (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            token_sesion TEXT DEFAULT '',
             repositorio TEXT NOT NULL,
             archivos_totales INTEGER NOT NULL,
             porcentaje_corte INTEGER NOT NULL,
@@ -46,7 +71,6 @@ def inicializar_bd():
             efectividad REAL NOT NULL
         )
     """)
-    # Migracion automatica en caso de que la tabla reportes_prioridad ya existiera con un esquema anterior
     cursor.execute("PRAGMA table_info(reportes_prioridad)")
     columnas = [col[1] for col in cursor.fetchall()]
     if "repositorio" not in columnas:
@@ -55,6 +79,8 @@ def inicializar_bd():
         cursor.execute("ALTER TABLE reportes_prioridad ADD COLUMN archivos_en_corte INTEGER DEFAULT 0")
     if "defectos_en_corte" not in columnas:
         cursor.execute("ALTER TABLE reportes_prioridad ADD COLUMN defectos_en_corte INTEGER DEFAULT 0")
+    if "token_sesion" not in columnas:
+        cursor.execute("ALTER TABLE reportes_prioridad ADD COLUMN token_sesion TEXT DEFAULT ''")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS credenciales_admin (
@@ -75,26 +101,26 @@ def inicializar_bd():
 
 inicializar_bd()
 
-def guardar_analisis_bd(repo, total, alto, porcentaje):
+def guardar_analisis_bd(repo, total, alto, porcentaje, token):
     conn = sqlite3.connect("sistema_predictivo.db")
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO analisis_repositorios
-        (repositorio, archivos_totales, archivos_alto_riesgo, porcentaje_riesgo)
-        VALUES (?, ?, ?, ?)
-    """, (repo, total, int(alto), round(porcentaje, 2)))
+        (token_sesion, repositorio, archivos_totales, archivos_alto_riesgo, porcentaje_riesgo)
+        VALUES (?, ?, ?, ?, ?)
+    """, (token, repo, total, int(alto), round(porcentaje, 2)))
     conn.commit()
     conn.close()
 
-def guardar_reporte_prioridad(repo, total, corte_pct, n_corte, defectos_en_corte, efectividad):
+def guardar_reporte_prioridad(repo, total, corte_pct, n_corte, defectos_en_corte, efectividad, token):
     conn = sqlite3.connect("sistema_predictivo.db")
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO reportes_prioridad
-        (repositorio, archivos_totales, porcentaje_corte, archivos_en_corte,
+        (token_sesion, repositorio, archivos_totales, porcentaje_corte, archivos_en_corte,
          defectos_en_corte, efectividad)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (repo, total, corte_pct, n_corte, defectos_en_corte, round(efectividad, 4)))
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (token, repo, total, corte_pct, n_corte, defectos_en_corte, round(efectividad, 4)))
     conn.commit()
     conn.close()
 
@@ -179,15 +205,8 @@ def analizar_repositorio_en_vivo(url_o_ruta, limite_commits=300):
     return pd.DataFrame(filas)
 
 def calcular_diagnostico_y_probabilidades(df):
-    """Calcula las probabilidades relativas de los tres tipos de defectos basados en sus metricas."""
-    # Las tres metricas asociadas:
-    # 1. Defectos de Regresion / Inestabilidad -> Churn
-    # 2. Defectos Logicos y Algoritmicos -> Complejidad Ciclomatica (CC)
-    # 3. Defectos de Rendimiento / Sobrecarga -> Lineas de Codigo (LOC)
-    
     suma = df['LOC_norm'] + df['CC_norm'] + df['Churn_norm']
     
-    # Manejar caso donde las tres metricas sean 0 (repartir equitativamente)
     df['Prob_Regresion'] = np.where(suma > 0, (df['Churn_norm'] / suma) * df['Probabilidad_Defecto'], 0.0)
     df['Prob_Logico'] = np.where(suma > 0, (df['CC_norm'] / suma) * df['Probabilidad_Defecto'], 0.0)
     df['Prob_Rendimiento'] = np.where(suma > 0, (df['LOC_norm'] / suma) * df['Probabilidad_Defecto'], 0.0)
@@ -256,11 +275,12 @@ if modo_admin_solicitado:
         st.session_state["admin_autenticado"] = False
         st.rerun()
 
-    tab_bench, tab_roc, tab_corpus, tab_reportes = st.tabs([
+    tab_bench, tab_roc, tab_corpus, tab_reportes, tab_auditoria = st.tabs([
         "Benchmarking de Modelos",
         "Curvas ROC Comparativas",
         "Corpus Maestro y Parametros",
-        "Reportes de Efectividad"
+        "Reportes de Efectividad",
+        "Auditoria de Sesiones y Analisis"
     ])
 
     with tab_bench:
@@ -309,10 +329,8 @@ if modo_admin_solicitado:
 
     with tab_roc:
         st.subheader("Curvas ROC Comparativas entre Modelos")
-        # Buscar la imagen localmente en desarrollo o en la carpeta figuras
         roc_path_desarrollo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curva_roc_comparativa.png")
         roc_path_figuras = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "figuras", "curva_roc_comparativa.png")
-
         roc_path = roc_path_desarrollo if os.path.exists(roc_path_desarrollo) else roc_path_figuras
 
         if os.path.exists(roc_path):
@@ -362,10 +380,10 @@ if modo_admin_solicitado:
             st.markdown(f"- **{k}:** {v}")
 
     with tab_reportes:
-        st.subheader("Reportes de Efectividad del Corte Prioritario")
+        st.subheader("Reportes Globales de Efectividad del Corte Prioritario")
         conn = sqlite3.connect("sistema_predictivo.db")
         df_rep = pd.read_sql_query(
-            "SELECT id, fecha, repositorio, archivos_totales, porcentaje_corte, "
+            "SELECT id, fecha, token_sesion, repositorio, archivos_totales, porcentaje_corte, "
             "archivos_en_corte, defectos_en_corte, efectividad "
             "FROM reportes_prioridad ORDER BY id DESC",
             conn
@@ -377,6 +395,22 @@ if modo_admin_solicitado:
         else:
             st.info("No hay reportes de efectividad todavia.")
 
+    with tab_auditoria:
+        st.subheader("Auditoria Global de Analisis (Todos los usuarios)")
+        st.caption("Vista completa de todos los repositorios procesados en la plataforma por token de sesion.")
+        conn = sqlite3.connect("sistema_predictivo.db")
+        df_audit = pd.read_sql_query(
+            "SELECT id, fecha, token_sesion, repositorio, archivos_totales, "
+            "archivos_alto_riesgo, porcentaje_riesgo "
+            "FROM analisis_repositorios ORDER BY id DESC",
+            conn
+        )
+        conn.close()
+        if not df_audit.empty:
+            st.dataframe(df_audit, use_container_width=True)
+        else:
+            st.info("No hay registros en la bitacora todavia.")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VISTA PREDETERMINADA: ANALISTA DE CALIDAD (OPERATIVO Y PUBLICO)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -386,6 +420,7 @@ else:
     st.sidebar.markdown("---")
     st.sidebar.info("Panel operativo para priorizacion de pruebas de software.")
     st.sidebar.caption("Lenguaje soportado: Java (.java)")
+    st.sidebar.markdown(f"**Tu Sesion:** `{token_actual}`")
 
     st.header("Panel del Analista de Calidad")
     st.markdown(
@@ -394,7 +429,7 @@ else:
     )
     st.info("Alcance del modelo: Calibrado exclusivamente para proyectos desarrollados en **Java**, analizando archivos con extension `.java`.")
 
-    tab_pred, tab_hist = st.tabs(["Solicitar Prediccion de Repositorio", "Historial de Reportes"])
+    tab_pred, tab_hist = st.tabs(["Solicitar Prediccion de Repositorio", "Mi Historial de Reportes"])
 
     with tab_pred:
         opcion_entrada = st.radio(
@@ -478,7 +513,7 @@ else:
                 altos = (df_repo['Nivel_Riesgo'] == 'ALTO').sum()
                 porc_alto = (altos / total_arch) * 100
 
-                guardar_analisis_bd(url_repo, total_arch, altos, porc_alto)
+                guardar_analisis_bd(url_repo, total_arch, altos, porc_alto, token_actual)
 
                 st.subheader("Resumen General de Riesgo")
                 c1, c2, c3 = st.columns(3)
@@ -532,7 +567,7 @@ else:
 
                 guardar_reporte_prioridad(
                     url_repo, total_arch, corte_prioridad,
-                    n_top, int(defectos_en_corte), efectividad
+                    n_top, int(defectos_en_corte), efectividad, token_actual
                 )
 
                 csv = df_priorizado.to_csv(index=False).encode('utf-8')
@@ -544,16 +579,18 @@ else:
                 st.warning("No se encontraron archivos Java modificados en el rango de commits indicado.")
 
     with tab_hist:
-        st.subheader("Historial de Analisis Almacenados en SQLite")
+        st.subheader("Mi Historial de Reportes")
+        st.caption("Solo se muestran los analisis generados durante tu sesion actual en este navegador.")
         conn = sqlite3.connect("sistema_predictivo.db")
         df_hist = pd.read_sql_query(
             "SELECT id, fecha, repositorio, archivos_totales, "
             "archivos_alto_riesgo, porcentaje_riesgo "
-            "FROM analisis_repositorios ORDER BY id DESC",
-            conn
+            "FROM analisis_repositorios WHERE token_sesion = ? ORDER BY id DESC",
+            conn,
+            params=(token_actual,)
         )
         conn.close()
         if not df_hist.empty:
             st.dataframe(df_hist, use_container_width=True)
         else:
-            st.info("No hay analisis guardados todavia en la base de datos.")
+            st.info("No has realizado ningun analisis en esta sesion todavia. Ejecuta un analisis para verlo registrado aqui.")
